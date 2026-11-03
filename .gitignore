@@ -1,0 +1,9 @@
+/target/
+/runs/
+/data/
+__pycache__/
+
+/reports/
+*.bin
+/vendor/**/target/
+/vendor/Ninjask/data/

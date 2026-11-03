@@ -1,0 +1,113 @@
+{
+  "format": {
+    "id": "enumerationtest",
+    "gameType": "singles"
+  },
+  "typechart": {
+    "Normal": {},
+    "Bug": {}
+  },
+  "species": [
+    {
+      "id": "fast",
+      "name": "Fast",
+      "baseSpecies": "Fast",
+      "types": [
+        "Normal"
+      ],
+      "baseStats": {
+        "hp": 100,
+        "atk": 100,
+        "def": 100,
+        "spa": 100,
+        "spd": 100,
+        "spe": 100
+      },
+      "gender": "N"
+    },
+    {
+      "id": "slow",
+      "name": "Slow",
+      "baseSpecies": "Slow",
+      "types": [
+        "Normal"
+      ],
+      "baseStats": {
+        "hp": 100,
+        "atk": 100,
+        "def": 100,
+        "spa": 100,
+        "spd": 100,
+        "spe": 50
+      },
+      "gender": "N"
+    }
+  ],
+  "moves": [
+    {
+      "id": "tackle",
+      "name": "Tackle",
+      "type": "Normal",
+      "category": "Physical",
+      "target": "normal",
+      "basePower": 40,
+      "accuracy": true,
+      "pp": 35,
+      "priority": 0,
+      "flags": {}
+    },
+    {
+      "id": "splash",
+      "name": "Splash",
+      "type": "Normal",
+      "category": "Status",
+      "target": "self",
+      "basePower": 0,
+      "accuracy": true,
+      "pp": 35,
+      "priority": 0,
+      "flags": {}
+    },
+    {
+      "id": "uturn",
+      "name": "U-turn",
+      "type": "Bug",
+      "category": "Physical",
+      "target": "normal",
+      "basePower": 70,
+      "accuracy": true,
+      "pp": 35,
+      "priority": 0,
+      "flags": {},
+      "selfSwitch": true
+    },
+    {
+      "id": "doublehit",
+      "name": "Double Hit",
+      "type": "Normal",
+      "category": "Physical",
+      "target": "normal",
+      "basePower": 35,
+      "accuracy": true,
+      "pp": 35,
+      "priority": 0,
+      "flags": {},
+      "multihit": 2
+    }
+  ],
+  "abilities": [
+    {
+      "id": "noability",
+      "name": "No Ability"
+    },
+    {
+      "id": "battlearmor",
+      "name": "Battle Armor"
+    }
+  ],
+  "items": [],
+  "natures": {
+    "hardy": {}
+  },
+  "conditions": {}
+}
