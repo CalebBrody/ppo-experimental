@@ -71,7 +71,6 @@ pub fn encode_state(t: &Tracker) -> Vec<f32> {
             let f = &mut out[(relative * 6 + i) * FEATURES..(relative * 6 + i + 1) * FEATURES];
             f[0] = 1.;
             f[1] = relative as f32;
-            f[2 + i] = 1.;
             f[8] = m.hp as f32 / m.maxhp.max(1) as f32;
             f[9] = m.fainted as u8 as f32;
             f[10] = m.seen as u8 as f32;
@@ -129,10 +128,12 @@ pub fn encode_state(t: &Tracker) -> Vec<f32> {
                 f[229] = 1.;
             }
             f[230] = m.mega as u8 as f32;
-            if let Some(pos) = m.team_pos {
-                if pos < 6 {
-                    f[231 + pos] = 1.;
-                }
+            if let Some(bounds) = t.speed_bounds(side, i) {
+                f[231] = 1.;
+                f[232] = bounds.min as f32 / 500.;
+                f[233] = bounds.max as f32 / 500.;
+                f[234] = (bounds.max - bounds.min) as f32 / 500.;
+                f[235] = (bounds.min == bounds.max) as u8 as f32;
             }
         }
     }
@@ -166,21 +167,30 @@ pub fn observe(b: &Battle, t: &Tracker, cs: &[Choice]) -> Vec<f32> {
     out.resize(OBS, 0.);
     for (j, c) in cs.iter().enumerate() {
         let f = &mut out[STATE + j * ACTION_FEATURES..STATE + (j + 1) * ACTION_FEATURES];
+        f[ACTION_DESCRIPTOR..].fill(TOKENS as f32);
         match c {
             Choice::Preview(order) => {
                 f[31] = 1.;
                 for (slot, &index) in order.iter().enumerate() {
-                    f[slot * 6 + index] = 1.;
+                    f[ACTION_DESCRIPTOR + slot] = own_reference(t, index);
                 }
             }
             Choice::Turn(slots) => {
                 for (k, c) in slots.iter().enumerate() {
+                    f[ACTION_DESCRIPTOR + k] = active_reference(t, t.me, k);
+                    f[ACTION_DESCRIPTOR + 2 + k] = match c {
+                        SlotChoice::Switch { index } => own_reference(t, *index),
+                        SlotChoice::Move { target, .. } if *target != 0 => {
+                            let side = if *target > 0 { 1 - t.me } else { t.me };
+                            active_reference(t, side, target.unsigned_abs() as usize - 1)
+                        }
+                        _ => TOKENS as f32,
+                    };
                     let f = &mut f[k * 16..(k + 1) * 16];
                     match c {
                         SlotChoice::Pass => f[0] = 1.,
-                        SlotChoice::Switch { index } => {
+                        SlotChoice::Switch { .. } => {
                             f[1] = 1.;
-                            f[2 + index] = 1.;
                         }
                         SlotChoice::Move { slot, target, mega } => {
                             f[8] = 1.;
@@ -192,7 +202,6 @@ pub fn observe(b: &Battle, t: &Tracker, cs: &[Choice]) -> Vec<f32> {
                                 f[11] = m.base_power as f32 / 250.;
                                 f[12] = m.accuracy.unwrap_or(100) as f32 / 100.;
                                 f[13] = m.priority as f32 / 7.;
-                                f[14] = *slot as f32 / 4.;
                             } else {
                                 f[15] = 1.;
                             }
@@ -203,6 +212,26 @@ pub fn observe(b: &Battle, t: &Tracker, cs: &[Choice]) -> Vec<f32> {
         }
     }
     out
+}
+
+// Engine indices only route actions to their entities. The policy receives the
+// selected entity embedding, never the numeric index or a roster-position bit.
+fn own_reference(t: &Tracker, position: usize) -> f32 {
+    t.sides[t.me]
+        .mons
+        .iter()
+        .position(|m| m.team_pos == Some(position))
+        .expect("legal action must refer to a tracked own Pokemon") as f32
+}
+
+fn active_reference(t: &Tracker, side: usize, slot: usize) -> f32 {
+    t.sides[side]
+        .mons
+        .iter()
+        .position(|m| m.slot == Some(slot))
+        .map_or(TOKENS as f32, |i| {
+            (if side == t.me { 0 } else { 6 } + i) as f32
+        })
 }
 
 pub fn sync(b: &Battle, trackers: &mut [Tracker; 2], cursor: &mut usize) {
