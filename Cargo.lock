@@ -3492,10 +3492,63 @@ dependencies = [
 
 [[package]]
 name = "rl4burn"
-version = "0.1.1"
+version = "0.2.0"
+source = "git+https://github.com/RPP1011/rl4burn?branch=master#a265ac3b89f217ba247ef34778614cd7c3128e1c"
+dependencies = [
+ "rl4burn-algo",
+ "rl4burn-collect",
+ "rl4burn-core",
+ "rl4burn-envs",
+ "rl4burn-nn",
+]
+
+[[package]]
+name = "rl4burn-algo"
+version = "0.2.0"
+source = "git+https://github.com/RPP1011/rl4burn?branch=master#a265ac3b89f217ba247ef34778614cd7c3128e1c"
+dependencies = [
+ "burn",
+ "rand 0.10.3",
+ "rl4burn-collect",
+ "rl4burn-core",
+ "rl4burn-nn",
+]
+
+[[package]]
+name = "rl4burn-collect"
+version = "0.2.0"
+source = "git+https://github.com/RPP1011/rl4burn?branch=master#a265ac3b89f217ba247ef34778614cd7c3128e1c"
 dependencies = [
  "burn",
  "contracts",
+ "rand 0.10.3",
+ "rl4burn-core",
+ "rl4burn-nn",
+]
+
+[[package]]
+name = "rl4burn-core"
+version = "0.2.0"
+source = "git+https://github.com/RPP1011/rl4burn?branch=master#a265ac3b89f217ba247ef34778614cd7c3128e1c"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rl4burn-envs"
+version = "0.2.0"
+source = "git+https://github.com/RPP1011/rl4burn?branch=master#a265ac3b89f217ba247ef34778614cd7c3128e1c"
+dependencies = [
+ "rand 0.10.3",
+ "rl4burn-core",
+]
+
+[[package]]
+name = "rl4burn-nn"
+version = "0.2.0"
+source = "git+https://github.com/RPP1011/rl4burn?branch=master#a265ac3b89f217ba247ef34778614cd7c3128e1c"
+dependencies = [
+ "burn",
  "rand 0.10.3",
  "rand_distr 0.6.0",
 ]

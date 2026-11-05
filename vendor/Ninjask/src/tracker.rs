@@ -79,11 +79,34 @@ pub struct MonView {
     pub mega: bool,
     /// The move last seen used (Encore, Disable and Stomping Tantrum depend on it).
     pub last_move: Option<MoveId>,
+    /// Move named when Disable began; later moves must not change its target.
+    pub disabled_move: Option<MoveId>,
+    /// Lock established since the latest item acquisition/entry. With an unknown
+    /// item this is conditional on a Choice item, never a general last-move alias.
+    pub choice_lock: Option<MoveId>,
+    /// Item loss while Unburden was known or still possible. World checks the
+    /// assumed ability too. Reset on entry and ability replacement, not item gain.
+    pub unburden_active: bool,
+    /// Completed badly-poisoned residual ticks during this field stay (0..=15).
+    pub toxic_stage: u8,
+    toxic_tick_turn: Option<u32>,
     /// Own side: position in the latest request's Pokémon list (0 and 1 are
     /// on the field; `switch k` brings in position k - 1).
     pub team_pos: Option<usize>,
     /// Own side: atk, def, spa, spd, spe from the request.
     pub stats: Option<[u16; 5]>,
+    /// Own-team build metadata, supplied in own requests (never read from foes).
+    pub stat_points: Option<[u16; 6]>,
+    /// Protean/Libero has activated during this ability's current field stay.
+    pub type_change_used: bool,
+    /// Public action result, used by Stomping Tantrum/Temper Flare.
+    pub move_this_turn_result: Option<bool>,
+    pub move_last_turn_result: Option<bool>,
+    /// Observed sleep/freeze action checks since application; survive switching.
+    pub status_actions: u8,
+    pub rest_sleep: bool,
+    /// Charging move identity, committed relative target location, start turn.
+    pub charging: Option<(MoveId, i8, u32)>,
     /// The name an Illusion shows this Pokémon under, when the tracker can
     /// tell (one's own; a foe appearing as a teammate already on the field).
     pub shown_as: Option<String>,
@@ -155,6 +178,38 @@ struct PreTransform {
 }
 
 impl MonView {
+    fn toxic_tick(&mut self, turn: u32) {
+        if self.status == Status::Tox && self.toxic_tick_turn != Some(turn) {
+            self.toxic_stage = self.toxic_stage.saturating_add(1).min(15);
+            self.toxic_tick_turn = Some(turn);
+        }
+    }
+
+    fn set_status(&mut self, status: Status) {
+        if status != self.status {
+            self.status_actions = 0;
+            self.rest_sleep = false;
+            self.toxic_stage = 0;
+            self.toxic_tick_turn = None;
+        }
+        self.status = status;
+    }
+
+    /// A real acquisition, unlike Frisk/Poltergeist merely revealing an item.
+    fn gain_item(&mut self, item: ItemId) {
+        self.item = ItemView::Known(item);
+        self.choice_lock = None;
+    }
+
+    fn lose_item(&mut self, dex: &Dex, item: Option<ItemId>, suppressed: bool) {
+        if !suppressed && self.ability.is_none_or(|a| dex.ability(a).id == "unburden") {
+            self.unburden_active = true;
+        }
+        self.item = ItemView::None;
+        self.prev_item = item;
+        self.choice_lock = None;
+    }
+
     fn has_volatile(&self, id: &str) -> bool {
         self.volatiles.iter().any(|v| v == id)
     }
@@ -173,6 +228,12 @@ impl MonView {
     }
     fn remove_volatile(&mut self, id: &str) {
         self.volatiles.retain(|v| v != id);
+        if id == "twoturnmove" {
+            self.charging = None;
+        }
+        if id == "disable" {
+            self.disabled_move = None;
+        }
     }
     /// One's own rampage, from the request: locked into `shown` (the
     /// request's one move) when that is a rampage, else not.
@@ -214,6 +275,15 @@ impl MonView {
         self.speed_swap_bounds = None;
         self.volatile_since.clear();
         self.volatile_length.clear();
+        self.disabled_move = None;
+        self.type_change_used = false;
+        self.move_this_turn_result = None;
+        self.move_last_turn_result = None;
+        self.charging = None;
+        self.choice_lock = None;
+        self.unburden_active = false;
+        self.toxic_stage = 0;
+        self.toxic_tick_turn = None;
         self.acted_this_turn = false;
         self.entered_this_turn = false;
         self.trap_sources.clear();
@@ -234,6 +304,17 @@ impl MonView {
         self.speed_swap_bounds = src.speed_swap_bounds;
         self.volatile_since.clone_from(&src.volatile_since);
         self.volatile_length.clone_from(&src.volatile_length);
+        self.disabled_move = src.disabled_move;
+        self.type_change_used = src.type_change_used;
+        self.move_this_turn_result = src.move_this_turn_result;
+        self.move_last_turn_result = src.move_last_turn_result;
+        self.status_actions = src.status_actions;
+        self.rest_sleep = src.rest_sleep;
+        self.charging = src.charging;
+        self.choice_lock = src.choice_lock;
+        self.unburden_active = src.unburden_active;
+        self.toxic_stage = src.toxic_stage;
+        self.toxic_tick_turn = src.toxic_tick_turn;
         self.acted_this_turn = src.acted_this_turn;
         self.entered_this_turn = src.entered_this_turn;
         self.trap_sources.clone_from(&src.trap_sources);
@@ -278,6 +359,8 @@ impl MonView {
             self.base_ability = old;
             self.ability_swapped = old.is_none();
         }
+        self.unburden_active = false;
+        self.type_change_used = false;
         self.ability = new;
     }
 }
@@ -329,6 +412,10 @@ impl SideView {
 pub struct FieldView {
     /// Weather and the turn it started.
     pub weather: Option<(Weather, u32)>,
+    pub weather_source: Option<(usize, String)>,
+    pub weather_item: ItemView,
+    pub terrain_source: Option<(usize, String)>,
+    pub terrain_item: ItemView,
     pub terrain: Option<(Terrain, u32)>,
     pub trick_room: Option<u32>,
     /// Gravity and the turn it started.
@@ -353,6 +440,7 @@ struct MoveLine {
     minimize: bool,
     /// A rampage's use count, once a hit shows it landed.
     lock_uses: Option<u8>,
+    landed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -588,6 +676,7 @@ impl Tracker {
 
     fn feed_line(&mut self, raw: &str) {
         let Some(l) = Line::parse(raw) else { return };
+        self.observe_move_result(&l);
         if matches!(l.kind, "turn" | "upkeep" | "cant") {
             self.called_move = None;
             self.move_line = None;
@@ -683,14 +772,18 @@ impl Tracker {
             "-status" => {
                 if let Some(st) = Status::from_id(l.arg(1)) {
                     if let Some(m) = self.mon_mut(l.arg(0)) {
-                        m.status = st;
+                        m.toxic_stage = 0;
+                        m.toxic_tick_turn = None;
+                        m.set_status(st);
+                        m.status_actions = 0;
+                        m.rest_sleep = st == Status::Slp && l.tag("from") == Some("move: Rest");
                     }
                 }
                 self.attribute(&l, l.arg(0));
             }
             "-curestatus" => {
                 if let Some(m) = self.mon_mut(l.arg(0)) {
-                    m.status = Status::None;
+                    m.set_status(Status::None);
                 }
                 self.attribute(&l, l.arg(0));
             }
@@ -840,14 +933,33 @@ impl Tracker {
                 self.reveal_move(l.arg(0), &mv, 0);
                 // Chilly Reception's `[premajor]` announces a move, not a charge.
                 if l.tag("premajor").is_none() {
+                    let id = self.dex.move_id(&mv);
+                    let target = if !l.arg(2).is_empty() {
+                        l.arg(2).to_string()
+                    } else {
+                        self.move_line
+                            .as_ref()
+                            .filter(|ml| ml.user == l.arg(0))
+                            .map(|ml| ml.target.clone())
+                            .unwrap_or_default()
+                    };
+                    let loc = match (parse_ref(l.arg(0)), parse_ref(&target)) {
+                        (Some((us, _, _)), Some((ts, Some(slot), _))) => {
+                            (slot as i8 + 1) * if us == ts { -1 } else { 1 }
+                        }
+                        _ => 0,
+                    };
+                    let turn = self.turn;
                     if let Some(m) = self.mon_mut(l.arg(0)) {
-                        m.add_volatile("twoturnmove");
+                        m.add_volatile_at("twoturnmove", turn);
+                        m.charging = id.map(|id| (id, loc, turn));
                     }
                 }
             }
             // Gastro Acid ("-endability|X") suppresses the ability until X leaves.
             "-endability" => {
                 if let Some(m) = self.mon_mut(l.arg(0)) {
+                    m.unburden_active = false;
                     m.add_volatile("gastroacid");
                 }
             }
@@ -874,6 +986,9 @@ impl Tracker {
     }
 
     /// Feed this player's request: exact information about its own team.
+    /// The engine includes own-only `nature` and `statPoints` metadata, needed
+    /// to recalculate stats on Mega Evolution/forme changes. External adapters
+    /// can add these from the player's own team; never from the opponent's team.
     pub fn feed_request(&mut self, req: &Value) {
         let me = self.me;
         let Some(list) = req["side"]["pokemon"].as_array() else {
@@ -933,6 +1048,15 @@ impl Tracker {
             m.level = level;
             m.gender = gender;
             m.team_pos = Some(i);
+            if let (Some((id, _, start)), Some(loc)) = (m.charging, p["chargingTarget"].as_i64()) {
+                m.charging = Some((id, loc as i8, start));
+            }
+            if let Some(nature) = p["nature"].as_str() {
+                m.nature = Some(nature.into());
+            }
+            if let Ok(points) = serde_json::from_value::<[u16; 6]>(p["statPoints"].clone()) {
+                m.stat_points = Some(points);
+            }
             // The request knows which of one's own Pokémon are on the field.
             let fainted = p["condition"].as_str().is_some_and(|c| c.ends_with("fnt"));
             if p["active"].as_bool() == Some(true) && !fainted {
@@ -950,7 +1074,7 @@ impl Tracker {
                 if maxhp > 0 {
                     m.maxhp = maxhp;
                 }
-                m.status = status;
+                m.set_status(status);
                 m.fainted = fainted;
             }
             m.ability = p["ability"].as_str().and_then(|a| dex.ability_id(a));
@@ -1069,6 +1193,15 @@ impl Tracker {
                 _ => None,
             };
             m.team_pos = Some(i);
+            m.nature = Some(em.nature_name.into());
+            m.stat_points = Some(em.points);
+            // The player knows its own submitted target even when the public
+            // charge announcement omits it. Never inspect the foe's target.
+            if let Some((id, _, start)) = m.charging {
+                if em.vol.charging == Some(id) {
+                    m.charging = Some((id, em.vol.charging_target_loc, start));
+                }
+            }
             if em.is_active && em.hp > 0 && i < side.n_active {
                 actives.push((em.name.to_string(), i));
             }
@@ -1077,18 +1210,18 @@ impl Tracker {
             m.stats = Some([st[1], st[2], st[3], st[4], st[5]]);
             if em.hp == 0 {
                 m.hp = 0;
-                m.status = Status::None;
+                m.set_status(Status::None);
                 m.fainted = true;
             } else {
                 m.hp = em.hp;
                 if em.maxhp > 0 {
                     m.maxhp = em.maxhp;
                 }
-                m.status = if em.status == Status::Fnt {
+                m.set_status(if em.status == Status::Fnt {
                     Status::None
                 } else {
                     em.status
-                };
+                });
                 m.fainted = false;
             }
             m.ability = Some(em.ability);
@@ -1380,7 +1513,7 @@ impl Tracker {
         if let Some((hp, maxhp, status, fainted)) = parse_condition(l.arg(2)) {
             m.hp = hp;
             m.maxhp = maxhp;
-            m.status = status;
+            m.set_status(status);
             m.fainted = fainted;
         }
     }
@@ -1404,8 +1537,56 @@ impl Tracker {
             m.added_type = None;
             m.types = None;
             if mega_ability.is_some() {
+                m.unburden_active = false;
+                m.type_change_used = false;
                 m.ability = mega_ability;
                 m.base_ability = mega_ability;
+            }
+        }
+    }
+
+    fn observe_move_result(&mut self, l: &Line) {
+        let failed = matches!(l.kind, "-fail" | "-miss" | "-immune");
+        let blocked = l.kind == "-block"
+            || (l.kind == "-activate"
+                && matches!(
+                    l.arg(1),
+                    "move: Protect" | "move: Wide Guard" | "move: Quick Guard"
+                ));
+        let landed = matches!(
+            l.kind,
+            "-damage"
+                | "-status"
+                | "-boost"
+                | "-unboost"
+                | "-heal"
+                | "-start"
+                | "-singleturn"
+                | "-singlemove"
+        ) && l.tag("from").is_none();
+        let heal_not_fail = l.kind == "-fail"
+            && l.arg(1) == "heal"
+            && self
+                .move_line
+                .as_ref()
+                .and_then(|ml| ml.id)
+                .is_some_and(|id| self.dex.mv(id).id == "healpulse");
+        if let Some(ml) = self.move_line.as_mut() {
+            if landed || heal_not_fail {
+                ml.landed = true;
+            }
+            let user = ml.user.clone();
+            let success = ml.landed;
+            if landed || heal_not_fail || ((failed || blocked) && !success) {
+                if let Some(m) = self.mon_mut(&user) {
+                    // The engine distinguishes a failed action (false) from a
+                    // blocked hit (null); only false boosts FailurePower moves.
+                    m.move_this_turn_result = if blocked {
+                        None
+                    } else {
+                        Some(landed || heal_not_fail)
+                    };
+                }
             }
         }
     }
@@ -1425,6 +1606,9 @@ impl Tracker {
         }
         if let Some(m) = self.mon_mut(user) {
             m.acted_this_turn = true;
+        }
+        if let Some(m) = self.mon_mut(user) {
+            m.move_this_turn_result = Some(true);
         }
         self.move_effects(l);
         // A move another move called (Copycat, Sleep Talk) spends no PP and
@@ -1447,7 +1631,21 @@ impl Tracker {
             self.reveal_move(user, &name, 1);
         }
         let id = self.dex.move_id(&name);
+        let magic_room = self.field.magic_room.is_some();
+        let dex = self.dex.clone();
         if let Some(m) = self.mon_mut(user) {
+            let choice = match m.item {
+                ItemView::Unknown => true,
+                ItemView::Known(i) => dex.item_kind[i as usize].is_choice(),
+                ItemView::None => false,
+            };
+            let klutz = m.ability.is_some_and(|a| dex.ability(a).id == "klutz")
+                && !m.has_volatile("gastroacid");
+            if choice && !magic_room && !klutz && name != "Struggle" {
+                if let Some(id) = id {
+                    m.choice_lock.get_or_insert(id);
+                }
+            }
             if id.is_some() {
                 m.last_move = id;
             }
@@ -1600,7 +1798,11 @@ impl Tracker {
         if from == Some("recoil") || paid {
             return;
         }
+        let turn = self.turn;
         if let Some(m) = self.mon_mut(who) {
+            if from == Some("psn") {
+                m.toxic_tick(turn);
+            }
             // A foe's HP is a percentage, so a small hit can leave it as it
             // was: the line itself (shown only for nonzero damage) counts.
             m.hurt_this_turn = true;
@@ -1614,6 +1816,7 @@ impl Tracker {
         self.upkeep_done = false;
         for side in self.sides.iter_mut() {
             for m in side.mons.iter_mut() {
+                m.move_last_turn_result = m.move_this_turn_result.take();
                 m.hurt_this_turn = false;
                 m.acted_this_turn = false;
                 m.entered_this_turn = false;
@@ -1646,6 +1849,11 @@ impl Tracker {
                 }
             }
             for m in side.mons.iter_mut() {
+                // Includes ticks hidden by Magic Guard/Poison Heal. A visible
+                // damage tick may already have been counted before a mid-turn request.
+                if m.slot.is_some() && !m.fainted {
+                    m.toxic_tick(turn);
+                }
                 m.remove_volatile("endure");
                 if m.ally_switch.is_some_and(|(_, t)| turn > t) {
                     m.ally_switch = None;
@@ -1716,6 +1924,8 @@ impl Tracker {
                 }
             })
             .collect();
+        m.unburden_active = false;
+        m.type_change_used = false;
         m.ability = t.ability;
         m.base_ability = None;
         m.ability_swapped = false;
@@ -1731,6 +1941,12 @@ impl Tracker {
             _ => l.arg(0).to_string(),
         };
         if let Some(m) = self.mon_mut(&stopped) {
+            m.move_this_turn_result = Some(false);
+            if (reason == "slp" && m.status == Status::Slp)
+                || (reason == "frz" && m.status == Status::Frz)
+            {
+                m.status_actions = m.status_actions.saturating_add(1);
+            }
             m.acted_this_turn = true;
         }
         if let Some(m) = self.mon_mut(l.arg(0)) {
@@ -1773,7 +1989,7 @@ impl Tracker {
                     m.maxhp = maxhp;
                 }
                 if !fainted {
-                    m.status = status;
+                    m.set_status(status);
                 }
                 if fainted {
                     m.hp = 0;
@@ -1790,6 +2006,7 @@ impl Tracker {
         // move is lost, and Glaive Rush's drawback had already ended.
         if from == "confusion" && l.kind == "-damage" {
             if let Some(m) = self.mon_mut(who) {
+                m.move_this_turn_result = Some(false);
                 m.remove_volatile("twoturnmove");
                 m.remove_volatile("glaiverush");
             }
@@ -1830,13 +2047,28 @@ impl Tracker {
         }
     }
 
+    fn field_source(&self, l: &Line) -> (Option<(usize, String)>, ItemView) {
+        let who = l
+            .tag("of")
+            .or_else(|| self.move_line.as_ref().map(|ml| ml.user.as_str()));
+        who.and_then(|who| self.mon_index(who))
+            .map(|(s, k)| {
+                let m = &self.sides[s].mons[k];
+                (Some((s, m.name.clone())), m.item)
+            })
+            .unwrap_or((None, ItemView::Unknown))
+    }
+
     fn on_weather(&mut self, l: &Line) {
         let name = l.arg(0);
         if name == "none" {
             self.field.weather = None;
+            self.field.weather_source = None;
+            self.field.weather_item = ItemView::Unknown;
         } else if l.tag("upkeep").is_none() {
             if let Some(w) = Weather::from_id(&to_id(name)) {
                 self.field.weather = Some((w, self.residual_mark()));
+                (self.field.weather_source, self.field.weather_item) = self.field_source(l);
             }
         }
         self.attribute(l, "");
@@ -1856,8 +2088,11 @@ impl Tracker {
         } else if let Some(t) = Terrain::from_id(&id) {
             if start {
                 self.field.terrain = Some((t, self.residual_mark()));
+                (self.field.terrain_source, self.field.terrain_item) = self.field_source(l);
             } else if self.field.terrain.map(|(x, _)| x) == Some(t) {
                 self.field.terrain = None;
+                self.field.terrain_source = None;
+                self.field.terrain_item = ItemView::Unknown;
             }
         }
         self.attribute(l, "");
@@ -1978,6 +2213,9 @@ impl Tracker {
                 m.added_type = added;
                 if id == "typechange" {
                     m.types = types;
+                    if matches!(l.tag("from"), Some("ability: Protean" | "ability: Libero")) {
+                        m.type_change_used = true;
+                    }
                 }
             }
             if id == "typeadd" {
@@ -2008,9 +2246,15 @@ impl Tracker {
             }
         }
         // Disable names the disabled move.
-        if id == "disable" && !l.arg(2).is_empty() {
+        if id == "disable" {
             let mv = l.arg(2).to_string();
-            self.reveal_move(who, &mv, 0);
+            let disabled = self.dex.move_id(&mv);
+            if !mv.is_empty() {
+                self.reveal_move(who, &mv, 0);
+            }
+            if let Some(m) = self.mon_mut(who) {
+                m.disabled_move = disabled.or(m.last_move);
+            }
         }
         if id == "octolock" {
             if let Some(of) = l.tag("of").map(str::to_string) {
@@ -2179,18 +2423,47 @@ impl Tracker {
         }
     }
 
+    fn public_ability_suppressed(&self, who: &str) -> bool {
+        self.mon_index(who)
+            .is_some_and(|(s, k)| self.sides[s].mons[k].has_volatile("gastroacid"))
+            || self.sides.iter().flat_map(|s| &s.mons).any(|m| {
+                m.slot.is_some()
+                    && !m.fainted
+                    && !m.has_volatile("gastroacid")
+                    && m.ability
+                        .is_some_and(|a| self.dex.ability(a).id == "neutralizinggas")
+            })
+    }
+
     fn on_item(&mut self, l: &Line) {
         let Some(id) = self.dex.item_id(l.arg(1)) else {
             return;
         };
         let tricked = matches!(l.tag("from"), Some("move: Trick" | "move: Switcheroo"));
+        let gained = tricked
+            || matches!(
+                l.tag("from"),
+                Some(
+                    "ability: Pickpocket"
+                        | "ability: Magician"
+                        | "move: Covet"
+                        | "move: Thief"
+                        | "move: Bestow"
+                        | "move: Recycle"
+                        | "ability: Harvest"
+                )
+            );
         if let Some(m) = self.mon_mut(l.arg(0)) {
             // An item Trick gave can be used up (White Herb) before the line
             // that names it.
             if tricked && m.item == ItemView::None && m.prev_item == Some(id) {
                 return;
             }
-            m.item = ItemView::Known(id);
+            if gained {
+                m.gain_item(id);
+            } else {
+                m.item = ItemView::Known(id);
+            }
             m.prev_item = None;
         }
         // Pickpocket is the new holder's ability; Frisk's holder is "[of]".
@@ -2207,9 +2480,12 @@ impl Tracker {
                 if from == "ability: Magician" {
                     self.reveal_ability(l.arg(0), "Magician");
                 }
-                if let Some(m) = l.tag("of").and_then(|of| self.mon_mut(of)) {
-                    m.item = ItemView::None;
-                    m.prev_item = Some(id);
+                if let Some(of) = l.tag("of") {
+                    let suppressed = self.public_ability_suppressed(of);
+                    let dex = self.dex.clone();
+                    if let Some(m) = self.mon_mut(of) {
+                        m.lose_item(&dex, Some(id), suppressed);
+                    }
                 }
             }
             _ => {}
@@ -2218,6 +2494,8 @@ impl Tracker {
 
     fn on_enditem(&mut self, l: &Line) {
         let who = l.arg(0);
+        let suppressed = self.public_ability_suppressed(who);
+        let dex = self.dex.clone();
         // The item was shown leaving; the Pokémon now holds nothing (Trick's
         // silent line is followed by the `-item` that gives it the new one).
         let id = self.dex.item_id(l.arg(1));
@@ -2246,8 +2524,10 @@ impl Tracker {
             if weaken && m.prev_item == id && id.is_some() {
                 return;
             }
-            m.item = ItemView::None;
-            m.prev_item = id;
+            // Cud Chew's repeated eating is not another loss of a held item.
+            if !again {
+                m.lose_item(&dex, id, suppressed);
+            }
         }
     }
 
@@ -2260,6 +2540,8 @@ impl Tracker {
             Some(Named::Ability("Trace")) => {
                 let old = l.arg(2).to_string();
                 if let Some(m) = self.mon_mut(&who) {
+                    m.unburden_active = false;
+                    m.type_change_used = false;
                     m.ability = dex.ability_id(&name);
                     m.base_ability = dex.ability_id(&old);
                 }
@@ -2369,6 +2651,7 @@ impl Tracker {
             for who in [who.as_str(), other.as_str()] {
                 if let Some(m) = self.mon_mut(who) {
                     m.prev_item = None;
+                    m.choice_lock = None;
                 }
             }
         }
@@ -2384,9 +2667,10 @@ impl Tracker {
             if let (Some(m), true) = (self.mon_mut(&who), who != ally) {
                 m.item = ItemView::None;
                 m.prev_item = id;
+                m.choice_lock = None;
             }
             if let (Some(id), Some(m)) = (id, self.mon_mut(&ally)) {
-                m.item = ItemView::Known(id);
+                m.gain_item(id);
             }
         }
         // Feint, and other moves that break protection ("[broken]"), end the
@@ -2879,7 +3163,7 @@ impl Tracker {
         let dex = &self.dex;
         let mon = |si: usize, k: usize, m: &MonView| {
             let (trapped, shed) = self.trap_state(si, k);
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "name": m.name,
                 "species": m.species.map(|s| dex.species(s).id.clone()),
                 "preview": m.preview,
@@ -2903,8 +3187,14 @@ impl Tracker {
                 },
                 "mega": m.mega,
                 "lastMove": m.last_move.map(|x| dex.mv(x).id.clone()),
+                "choiceLock": m.choice_lock.map(|x| dex.mv(x).id.clone()),
+                "unburdenActive": m.unburden_active,
+                "toxicStage": m.toxic_stage,
                 "teamPos": m.team_pos,
                 "stats": m.stats,
+                "statPoints": m.stat_points,
+                "typeChangeUsed": m.type_change_used,
+                "charging": m.charging,
                 "speedBounds": self.speed_bounds(si, k),
                 "transformed": m.transformed.map(|s| dex.species(s).id.clone()),
                 "addedType": m.added_type.map(|t| dex.type_names[t as usize].clone()),
@@ -2921,7 +3211,12 @@ impl Tracker {
                 "cudChew": m.cud_chew,
                 "illusionBroken": m.illusion_broken,
                 "shownAs": m.shown_as,
-            })
+            });
+            value["statusActions"] = serde_json::json!(m.status_actions);
+            value["restSleep"] = serde_json::json!(m.rest_sleep);
+            value["moveThisTurnResult"] = serde_json::json!(m.move_this_turn_result);
+            value["moveLastTurnResult"] = serde_json::json!(m.move_last_turn_result);
+            value
         };
         let side = |si: usize, s: &SideView| {
             serde_json::json!({

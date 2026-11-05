@@ -29,6 +29,9 @@ def main():
     decisions={0:0,**{m['update']:m['decisions'] for m in metrics}}
     summary={'run':str(args.run),'updates':last['update'],'decisions':last['decisions'],
              'training_games':last['games'],'training_seconds':last['seconds'],'evaluations':{},
+             'self_play_wins':sum(m['wins'] for m in metrics),
+             'self_play_losses':sum(m['losses'] for m in metrics),
+             'self_play_draws':sum(m['draws'] for m in metrics),
              'method':'95% bootstrap intervals, resampling same-team side-swapped game pairs; draws count as half a win'}
     plt.rcParams.update({'font.family':'DejaVu Sans','font.size':11,'axes.spines.top':False,'axes.spines.right':False})
     fig,axes=plt.subplots(2,2,figsize=(13,8.8),gridspec_kw={'height_ratios':[1.25,1]})
@@ -75,7 +78,7 @@ def main():
     ax.plot(x,smooth(vals,20),color='#ac681a',linewidth=1.8,label='20-update average')
     ax.set(title='Value prediction loss',xlabel='Training decisions (thousands)',ylabel='PPO value loss')
     ax.grid(alpha=.15);ax.legend(frameon=False,fontsize=9)
-    fig.suptitle(f'Model1 · {last["seconds"]/60:.1f} minutes of RTX 2060 training',fontsize=19,fontweight='bold',x=.06,ha='left',y=.99)
+    fig.suptitle(f'Model1 experimental · {last["seconds"]/60:.1f} minutes of RTX 2060 training',fontsize=19,fontweight='bold',x=.06,ha='left',y=.99)
     fig.text(.06,.945,f'{last["games"]:,} training games · {last["decisions"]:,} learner decisions · {last["update"]} PPO updates',fontsize=12,color='#4a5563')
     fig.text(.06,.015,'Held-out teams; matching seeded setups with sides swapped. Score = wins + ½ draws. Bars: 95% paired-cluster bootstrap intervals.\n400 games per opponent at the start/end; 100 at intermediate checkpoints. One training seed; this is an early learning check, not an Elo estimate.',fontsize=9,color='#4a5563')
     fig.tight_layout(rect=[.025,.065,.99,.92])

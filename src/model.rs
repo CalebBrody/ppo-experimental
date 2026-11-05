@@ -8,7 +8,11 @@ pub const TOKENS: usize = 13;
 pub const FEATURES: usize = 256;
 pub const STATE: usize = TOKENS * FEATURES;
 pub const ACTIONS: usize = 2048;
-pub const ACTION_DESCRIPTOR: usize = 32;
+// Original two 16-feature action blocks, followed by 20 explicit move-type
+// flags for each actor. The type flags travel with the candidate action.
+pub const ACTION_TYPE_OFFSET: usize = 32;
+pub const ACTION_TYPE_COUNT: usize = 20;
+pub const ACTION_DESCRIPTOR: usize = ACTION_TYPE_OFFSET + 2 * ACTION_TYPE_COUNT;
 // Four routing references select entity embeddings; they are never neural features.
 pub const ACTION_FEATURES: usize = ACTION_DESCRIPTOR + 4;
 pub const OBS: usize = STATE + ACTIONS * ACTION_FEATURES;
@@ -25,6 +29,17 @@ pub struct Model<B: Backend> {
 }
 
 impl<B: Backend> Model<B> {
+    pub fn state_value(&self, state: Tensor<B, 2>) -> Tensor<B, 1> {
+        let batch = state.dims()[0];
+        let mut state = self.input.forward(state.reshape([batch, TOKENS, FEATURES]));
+        for block in &self.blocks {
+            state = block.forward(state, None);
+        }
+        self.value.forward(state.mean_dim(1)).reshape([batch])
+    }
+    pub fn action_input_width(&self) -> usize {
+        self.action.weight.dims()[0]
+    }
     pub fn new(device: &B::Device) -> Self {
         Self {
             input: LinearConfig::new(FEATURES, 64).init(device),
@@ -42,6 +57,8 @@ impl<B: Backend> Model<B> {
 impl<B: Backend> MaskedActorCritic<B> for Model<B> {
     fn forward(&self, obs: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 1>) {
         let batch = obs.dims()[0];
+        let width = obs.dims()[1];
+        let n_actions = (width - STATE) / ACTION_FEATURES;
         let mut state = self.input.forward(
             obs.clone()
                 .slice([0..batch, 0..STATE])
@@ -51,26 +68,27 @@ impl<B: Backend> MaskedActorCritic<B> for Model<B> {
             state = block.forward(state, None);
         }
         let pooled = state.clone().mean_dim(1);
-        let value = self.value.forward(pooled.clone()).reshape([batch]).tanh();
+        // HP progress plus terminal outcome can produce returns beyond [-1, 1].
+        let value = self.value.forward(pooled.clone()).reshape([batch]);
         let device = state.device();
         let entities = Tensor::cat(vec![state, Tensor::zeros([batch, 1, 64], &device)], 1);
-        let actions = obs
-            .slice([0..batch, STATE..OBS])
-            .reshape([batch, ACTIONS, ACTION_FEATURES]);
+        let actions =
+            obs.slice([0..batch, STATE..width])
+                .reshape([batch, n_actions, ACTION_FEATURES]);
         let mut parts = vec![
             self.action.forward(actions.clone().slice([
                 0..batch,
-                0..ACTIONS,
+                0..n_actions,
                 0..ACTION_DESCRIPTOR,
             ])),
-            pooled.repeat_dim(1, ACTIONS),
+            pooled.repeat_dim(1, n_actions),
         ];
         for role in 0..4 {
             let index = actions
                 .clone()
                 .slice([
                     0..batch,
-                    0..ACTIONS,
+                    0..n_actions,
                     ACTION_DESCRIPTOR + role..ACTION_DESCRIPTOR + role + 1,
                 ])
                 .int()
@@ -79,7 +97,7 @@ impl<B: Backend> MaskedActorCritic<B> for Model<B> {
         }
         let encoded = self.joint.forward(Tensor::cat(parts, 2)).tanh();
         (
-            self.policy.forward(encoded).reshape([batch, ACTIONS]),
+            self.policy.forward(encoded).reshape([batch, n_actions]),
             value,
         )
     }

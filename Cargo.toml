@@ -9,8 +9,8 @@ gpu = ["burn/wgpu"]
 cpu = ["burn/ndarray"]
 
 [dependencies]
-ninjask = { path = "vendor/Ninjask" }
-rl4burn = { path = "vendor/rl4burn" }
+ninjask = { path = "../Ninjask" }
+rl4burn = { git = "https://github.com/RPP1011/rl4burn", branch = "master" }
 burn = { version = "0.20", default-features = false, features = ["std", "autodiff"] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }

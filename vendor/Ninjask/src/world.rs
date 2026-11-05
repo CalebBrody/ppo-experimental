@@ -452,7 +452,11 @@ impl<'a> Builder<'a> {
         let species = species_of(dex, m).ok_or_else(|| format!("unknown species {}", m.preview))?;
         // The assumption, completed by the default.
         let asm = if own {
-            SetAssumption::default()
+            SetAssumption {
+                nature: m.nature.clone(),
+                points: m.stat_points,
+                ..Default::default()
+            }
         } else {
             let given = self.asm.foe.get(k).cloned().flatten().unwrap_or_default();
             let def = default_assumption(view, k);
@@ -532,12 +536,29 @@ impl<'a> Builder<'a> {
             _ => Status::None,
         };
         if mon.status == Status::Slp {
-            // Sleep's turns are secret: one more turn asleep at least.
+            // Unknown initial duration remains an assumption, but it cannot
+            // contradict observed sleep actions. Champions samples [2,3,3].
+            let decrement = if dex.ability(ability).id == "earlybird" {
+                2
+            } else {
+                1
+            };
+            let maximum = 3u8
+                .saturating_sub(m.status_actions.saturating_mul(decrement))
+                .max(1);
             mon.status_start_time = 3;
-            mon.status_time = 2;
+            mon.status_time = if m.rest_sleep {
+                maximum
+            } else {
+                2.min(maximum)
+            };
+        }
+        if mon.status == Status::Frz {
+            mon.status_start_time = 3;
+            mon.status_time = 3u8.saturating_sub(m.status_actions).max(1);
         }
         if mon.status == Status::Tox {
-            mon.toxic_stage = 1;
+            mon.toxic_stage = m.toxic_stage;
         }
         // Moves: one's own PP from the request, a foe's from its uses.
         for slot in mon.moves.iter_mut() {
@@ -553,6 +574,8 @@ impl<'a> Builder<'a> {
             }
         }
         mon.last_move = m.last_move;
+        mon.move_this_turn_result = m.move_this_turn_result;
+        mon.move_last_turn_result = m.move_last_turn_result;
         mon.is_active = m.slot.is_some() && m.slot == Some(position) || (position < 2 && m.fainted);
         if !mon.is_active || mon.fainted {
             // Off the field: nothing that lasts only while on it.
@@ -584,6 +607,22 @@ impl<'a> Builder<'a> {
             let stamp = mon.vol.added;
             mon.vol = crate::projection::projected_volatiles(dex, &vols);
             mon.vol.added = stamp;
+        }
+        // These effects have no ordinary volatile start message. Their public
+        // history is separate from last_move and remains conditional on hidden sets.
+        if dex.ability(ability).id == "unnerve" {
+            mon.ability_state.unnerved = Some(true);
+        }
+        if m.type_change_used {
+            match dex.ability(ability).id.as_str() {
+                "protean" => mon.ability_state.protean = Some(true),
+                "libero" => mon.ability_state.libero = Some(true),
+                _ => {}
+            }
+        }
+        mon.vol.unburden = m.unburden_active && dex.ability(ability).id == "unburden";
+        if item.is_some_and(|i| dex.item_kind[i as usize].is_choice()) {
+            mon.vol.choice_lock = m.choice_lock;
         }
         if let Some((_, _)) = m.locked {
             // The request shows one's own lock; a foe's needs its move.
@@ -621,8 +660,8 @@ impl<'a> Builder<'a> {
                     Some(mv) => json!({"duration": left(id, 3), "move": mv}),
                     None => continue,
                 },
-                "disable" => match &last {
-                    Some(mv) => json!({"duration": left(id, 4), "move": mv}),
+                "disable" => match m.disabled_move {
+                    Some(mv) => json!({"duration": left(id, 4), "move": dex.mv(mv).id}),
                     None => continue,
                 },
                 "taunt" => json!({"duration": left(id, 3)}),
@@ -658,16 +697,16 @@ impl<'a> Builder<'a> {
                     json!({"hasDragonType": dragon})
                 }
                 "twoturnmove" => {
-                    // The charging move: its known move with the `charge` flag.
-                    let charge = m
-                        .moves
-                        .iter()
-                        .map(|mv| mv.id)
-                        .find(|&id| dex.mv(id).has(MoveFlag::Charge));
-                    if let Some(c) = charge {
+                    if let Some((c, target, start)) = m.charging {
                         let cid = dex.mv(c).id.clone();
-                        out.insert(cid, json!({"duration": 2, "targetLoc": 0}));
-                        json!({"duration": 2, "move": dex.mv(c).id})
+                        let full = dex.cond_num(&cid, "duration").unwrap_or(0.) as u8;
+                        let duration = if full == 0 {
+                            0
+                        } else {
+                            self.left(start, full, full)
+                        };
+                        out.insert(cid, json!({"duration": duration, "targetLoc": target}));
+                        json!({"duration": self.left(start, 2, 2), "move": dex.mv(c).id})
                     } else {
                         continue;
                     }
@@ -719,20 +758,32 @@ impl<'a> Builder<'a> {
         let f = &self.view.field;
         let dex = b.dex.clone();
         let dur = |id: &str, default: u8| dex.cond_num(id, "duration").map_or(default, |x| x as u8);
-        // An extending item someone on the field holds (or is assumed to) makes 8 turns.
-        let held = |b: &Battle, item: &str| {
-            b.sides
-                .iter()
-                .flat_map(|s| s.mons.iter())
-                .any(|m| m.item.is_some_and(|i| b.dex.item(i).id == item))
+        // Duration belongs to the setter's item at onset, not another holder.
+        let held = |source: &Option<(usize, String)>, at_start: ItemView, item: &str| {
+            let id = match at_start {
+                ItemView::Known(i) => Some(i),
+                ItemView::None => None,
+                ItemView::Unknown => source.as_ref().and_then(|(s, name)| {
+                    b.sides[*s]
+                        .mons
+                        .iter()
+                        .find(|m| m.name.as_ref() == name)
+                        .and_then(|m| m.item)
+                }),
+            };
+            id.is_some_and(|id| dex.item(id).id == item)
         };
         if let Some((w, since)) = f.weather {
-            let full = if held(b, w.rock()) { 8 } else { dur(w.id(), 5) };
+            let full = if held(&f.weather_source, f.weather_item, w.rock()) {
+                8
+            } else {
+                dur(w.id(), 5)
+            };
             b.field.weather = Some(w);
             b.field.weather_turns = self.left(since, full, 8);
         }
         if let Some((t, since)) = f.terrain {
-            let full = if held(b, "terrainextender") {
+            let full = if held(&f.terrain_source, f.terrain_item, "terrainextender") {
                 8
             } else {
                 dur(t.id(), 5)

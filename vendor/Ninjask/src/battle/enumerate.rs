@@ -87,11 +87,16 @@ impl Battle {
         let mut path = PreciseState::new(mode);
         let mut outcomes: Vec<Outcome> = Vec::new();
         let mut indices: HashMap<BattleStateKey, usize> = HashMap::new();
+        let mut replayed_paths = 0u64;
+        let diagnose = std::env::var_os("NINJASK_ENUM_DECISIONS").is_some();
+        let mut signatures = std::collections::BTreeMap::<String, u64>::new();
         loop {
+            replayed_paths += 1;
             let mut battle = self.clone();
             battle.rng = Rng::precise(path);
             apply(&mut battle)?;
             path = std::mem::replace(&mut battle.rng, self.rng.clone()).into_precise();
+            if diagnose { *signatures.entry(path.diagnostic_signature()).or_default() += 1; }
             let probability = path.probability;
             let key = battle.state_key();
             if let Some(&index) = indices.get(&key) {
@@ -107,6 +112,10 @@ impl Battle {
                 break;
             }
         }
+        if std::env::var_os("NINJASK_COUNT_ENUM_PATHS").is_some() {
+            eprintln!("ENUM_PATH_COUNT paths={} merged_outcomes={}", replayed_paths, outcomes.len());
+        }
+        for (signature, count) in signatures { eprintln!("ENUM_DECISIONS count={count} {signature}"); }
         Ok(outcomes)
     }
 }

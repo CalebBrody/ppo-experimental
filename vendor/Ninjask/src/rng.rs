@@ -46,6 +46,7 @@ struct Decision {
     kind: DecisionKind,
     alternatives: u32,
     selected: u32,
+    site: &'static std::panic::Location<'static>,
 }
 
 /// A depth-first path through conditional chance decisions. Suffixes belong
@@ -68,12 +69,14 @@ impl PreciseState {
         }
     }
 
+    #[track_caller]
     fn choose(&mut self, kind: DecisionKind, alternatives: u32) -> (u32, f64) {
         if self.cursor == self.path.len() {
             self.path.push(Decision {
                 kind,
                 alternatives,
                 selected: 0,
+                site: std::panic::Location::caller(),
             });
         }
         let decision = &self.path[self.cursor];
@@ -104,6 +107,10 @@ impl PreciseState {
         self.cursor += 1;
         self.probability *= probability;
         (k, probability)
+    }
+
+    pub(crate) fn diagnostic_signature(&self) -> String {
+        self.path[..self.cursor].iter().map(|d| format!("{:?} x{} @ {}:{}", d.kind, d.alternatives, d.site.file(), d.site.line())).collect::<Vec<_>>().join(" -> ")
     }
 
     pub(crate) fn advance(&mut self) -> bool {

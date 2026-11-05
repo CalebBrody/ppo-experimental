@@ -1,4 +1,5 @@
 use crate::model::*;
+use crate::online_audit::{Sample, TrainingAudit};
 use burn::prelude::*;
 use ninjask::{
     battle::{log::Viewer, Team},
@@ -8,12 +9,26 @@ use ninjask::{
 };
 use rand::{rngs::SmallRng, RngExt, SeedableRng};
 use rl4burn::{ActionDist, Env, MaskedActorCritic, Space, Step};
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Choice {
     Preview(Vec<usize>),
     Turn(Vec<SlotChoice>),
+}
+
+/// Stable names, independent of dex IDs. First 18 are the ordinary battle types.
+pub const TYPE_FEATURE_NAMES: [&str; 20] = [
+    "Bug", "Dark", "Dragon", "Electric", "Fairy", "Fighting", "Fire", "Flying", "Ghost", "Grass",
+    "Ground", "Ice", "Normal", "Poison", "Psychic", "Rock", "Steel", "Water", "Stellar", "???",
+];
+
+fn type_feature(t: &Tracker, id: u8) -> Option<usize> {
+    let name = t.dex().type_names.get(id as usize)?;
+    TYPE_FEATURE_NAMES.iter().position(|known| *known == name)
 }
 
 pub fn choices(b: &Battle, side: usize) -> Vec<Choice> {
@@ -87,11 +102,30 @@ pub fn encode_state(t: &Tracker) -> Vec<f32> {
                 for j in 0..6 {
                     f[44 + j] = sp.base_stats[j] as f32 / 255.;
                 }
-                for ty in sp.types {
-                    if ty < 18 {
-                        f[50 + ty as usize] = 1.;
+            }
+            // Both sides use only player-visible current types. Overrides replace
+            // species defaults; added types are unioned. No hidden opponent state.
+            f[2] = (m.types.is_some() || m.species.is_some()) as u8 as f32;
+            f[3] = m.types.is_some() as u8 as f32;
+            let mut encode_type = |ty| {
+                if let Some(index) = type_feature(t, ty) {
+                    f[236 + index] = 1.;
+                    if index < 18 {
+                        f[50 + index] = 1.;
                     }
                 }
+            };
+            if let Some(types) = &m.types {
+                for &ty in types {
+                    encode_type(ty);
+                }
+            } else if let Some(id) = m.species {
+                for ty in t.dex().species(id).types {
+                    encode_type(ty);
+                }
+            }
+            if let Some(ty) = m.added_type {
+                encode_type(ty);
             }
             if let Some(id) = m.ability {
                 hash(&mut f[68..76], &t.dex().ability(id).id);
@@ -110,8 +144,14 @@ pub fn encode_state(t: &Tracker) -> Vec<f32> {
                 f[start + 6] = mv.pp.unwrap_or(0) as f32 / 64.;
                 f[start + 7] = mv.pp.is_some() as u8 as f32;
                 let extra = 128 + j * 24;
-                if data.type_ < 18 {
-                    f[extra + data.type_ as usize] = 1.;
+                if let Some(index) = type_feature(t, data.type_) {
+                    if index < 18 {
+                        f[extra + index] = 1.;
+                    }
+                    // Stellar has a separate flag rather than colliding with category.
+                    if index == 18 {
+                        f[4 + j] = 1.;
+                    }
                 }
                 f[extra + 18 + data.category as usize] = 1.;
                 f[extra + 21] = data.priority as f32 / 7.;
@@ -158,13 +198,18 @@ pub fn encode_state(t: &Tracker) -> Vec<f32> {
 }
 
 pub fn observe(b: &Battle, t: &Tracker, cs: &[Choice]) -> Vec<f32> {
+    observe_padded(b, t, cs, ACTIONS)
+}
+
+pub fn observe_padded(b: &Battle, t: &Tracker, cs: &[Choice], capacity: usize) -> Vec<f32> {
     assert!(
         !cs.is_empty() && cs.len() <= ACTIONS,
         "legal action capacity exceeded: {}",
         cs.len()
     );
     let mut out = encode_state(t);
-    out.resize(OBS, 0.);
+    assert!(cs.len() <= capacity);
+    out.resize(STATE + capacity * ACTION_FEATURES, 0.);
     for (j, c) in cs.iter().enumerate() {
         let f = &mut out[STATE + j * ACTION_FEATURES..STATE + (j + 1) * ACTION_FEATURES];
         f[ACTION_DESCRIPTOR..].fill(TOKENS as f32);
@@ -177,12 +222,26 @@ pub fn observe(b: &Battle, t: &Tracker, cs: &[Choice]) -> Vec<f32> {
             }
             Choice::Turn(slots) => {
                 for (k, c) in slots.iter().enumerate() {
+                    if let SlotChoice::Move { slot, .. } = c {
+                        // The action scorer receives its selected move's type
+                        // directly, without resolving a hash into a state move slot.
+                        if let Some(id) = b.choice_move_id((t.me, k), *slot) {
+                            if let Some(ty) = type_feature(t, b.dex.mv(id).type_) {
+                                f[ACTION_TYPE_OFFSET + k * ACTION_TYPE_COUNT + ty] = 1.;
+                            }
+                        }
+                    }
                     f[ACTION_DESCRIPTOR + k] = active_reference(t, t.me, k);
                     f[ACTION_DESCRIPTOR + 2 + k] = match c {
                         SlotChoice::Switch { index } => own_reference(t, *index),
-                        SlotChoice::Move { target, .. } if *target != 0 => {
-                            let side = if *target > 0 { 1 - t.me } else { t.me };
-                            active_reference(t, side, target.unsigned_abs() as usize - 1)
+                        SlotChoice::Move { target, .. } => {
+                            let target = b.choice_target_loc((t.me, k), *target);
+                            if target == 0 {
+                                TOKENS as f32
+                            } else {
+                                let side = if target > 0 { 1 - t.me } else { t.me };
+                                active_reference(t, side, target.unsigned_abs() as usize - 1)
+                            }
                         }
                         _ => TOKENS as f32,
                     };
@@ -194,10 +253,10 @@ pub fn observe(b: &Battle, t: &Tracker, cs: &[Choice]) -> Vec<f32> {
                         }
                         SlotChoice::Move { slot, target, mega } => {
                             f[8] = 1.;
-                            f[9] = *target as f32 / 2.;
+                            f[9] = b.choice_target_loc((t.me, k), *target) as f32 / 2.;
                             f[10] = *mega as u8 as f32;
-                            if let Some(mv) = b.sides[t.me].mons[k].moves.get(*slot) {
-                                let m = b.dex.mv(mv.id);
+                            if let Some(id) = b.choice_move_id((t.me, k), *slot) {
+                                let m = b.dex.mv(id);
                                 hash(&mut f[0..8], &m.id);
                                 f[11] = m.base_power as f32 / 250.;
                                 f[12] = m.accuracy.unwrap_or(100) as f32 / 100.;
@@ -260,7 +319,76 @@ pub fn sample<B: Backend>(
     ActionDist::Discrete(ACTIONS).sample(&logits, Some(&mask), None, rng)[0][0] as usize
 }
 
+/// Average per-Pokemon HP fractions; bench Pokemon count and fainted ones stay zero.
+/// After preview the simulator retains only the four brought Pokemon.
+pub fn hp_advantage(b: &Battle, side: usize) -> f32 {
+    if b.request == RequestState::TeamPreview {
+        return 0.;
+    }
+    let health = |s: usize| {
+        let mons = &b.sides[s].mons;
+        mons.iter()
+            .map(|m| {
+                if m.fainted {
+                    0.
+                } else {
+                    m.hp as f32 / m.maxhp.max(1) as f32
+                }
+            })
+            .sum::<f32>()
+            / mons.len().max(1) as f32
+    };
+    0.5 * (health(side) - health(1 - side))
+}
+
+/// Pay for progress since the previous decision, including the final transition.
+/// The terminal win/loss bonus is separate; unchanged HP never pays twice.
+pub fn battle_reward(b: &Battle, side: usize, done: bool, previous_advantage: f32) -> f32 {
+    let result = if done && b.ended {
+        b.winner
+            .map_or(0., |winner| if winner == side { 1. } else { -1. })
+    } else {
+        0.
+    };
+    hp_advantage(b, side) - previous_advantage + result
+}
+
+#[derive(Default)]
+pub struct TurnRewards {
+    pub turns: u64,
+    pub reward: f64,
+    pub unfinished_reward: f64,
+    pending: f64,
+    counted: u32,
+}
+impl TurnRewards {
+    pub fn record(&mut self, turn: u32, ended: bool, done: bool, reward: f32) {
+        self.pending += reward as f64;
+        let resolved = if ended { turn } else { turn.saturating_sub(1) };
+        let delta = resolved.saturating_sub(self.counted);
+        if delta > 0 {
+            self.turns += delta as u64;
+            self.reward += self.pending;
+            self.pending = 0.;
+            self.counted = resolved;
+        }
+        if done {
+            self.reset_game();
+        }
+    }
+    fn reset_game(&mut self) {
+        self.unfinished_reward += self.pending;
+        self.pending = 0.;
+        self.counted = 0;
+    }
+}
 pub struct BattleEnv<B: Backend> {
+    pub turn_rewards: Arc<Mutex<TurnRewards>>,
+    /// Actual completed-game outcomes, independent of shaped episode returns.
+    pub outcomes: Arc<Mutex<[usize; 3]>>,
+    pub audit: Option<Arc<Mutex<TrainingAudit>>>,
+    pub audit_every: usize,
+    audit_rng: SmallRng,
     dex: Arc<Dex>,
     teams: Arc<Vec<Team>>,
     pub battle: Battle,
@@ -271,23 +399,52 @@ pub struct BattleEnv<B: Backend> {
     cs: Vec<Choice>,
     rng: SmallRng,
     device: B::Device,
-    league: Rc<RefCell<Vec<Model<B>>>>,
+    league: Arc<Mutex<Vec<Model<B>>>>,
     opponent: Model<B>,
+    prepared_opponent: Option<Choice>,
     pub max_turns: u32,
 }
 
 impl<B: Backend> BattleEnv<B> {
+    pub fn side_view(&self, side: usize) -> &Tracker {
+        &self.trackers[side]
+    }
+    pub fn frozen_opponent(&self) -> &Model<B> {
+        &self.opponent
+    }
+    pub fn prepare_opponent(&mut self, choice: Choice) {
+        assert!(self.prepared_opponent.is_none());
+        assert!(self.battle.side_needs_choice(1 - self.side));
+        assert!(choices(&self.battle, 1 - self.side)
+            .iter()
+            .any(|c| format!("{c:?}") == format!("{choice:?}")));
+        self.prepared_opponent = Some(choice);
+    }
+    pub fn learner_view(&self) -> &Tracker {
+        &self.trackers[self.side]
+    }
+    pub fn learner_side(&self) -> usize {
+        self.side
+    }
+    pub fn legal_choices(&self) -> &[Choice] {
+        &self.cs
+    }
     pub fn new(
         dex: Arc<Dex>,
         teams: Arc<Vec<Team>>,
-        league: Rc<RefCell<Vec<Model<B>>>>,
+        league: Arc<Mutex<Vec<Model<B>>>>,
         device: B::Device,
         seed: u64,
         max_turns: u32,
     ) -> Self {
         let battle = Battle::from_teams(dex.clone(), [&teams[0], &teams[0]], ["p1", "p2"], seed);
-        let opponent = league.borrow()[0].clone();
+        let opponent = league.lock().unwrap()[0].clone();
         Self {
+            turn_rewards: Arc::new(Mutex::new(TurnRewards::default())),
+            outcomes: Arc::new(Mutex::new([0; 3])),
+            audit: None,
+            audit_every: 0,
+            audit_rng: SmallRng::seed_from_u64(seed ^ 0xD1A6_0057),
             trackers: [Tracker::new(dex.clone(), 0), Tracker::new(dex.clone(), 1)],
             dex,
             teams,
@@ -300,10 +457,14 @@ impl<B: Backend> BattleEnv<B> {
             device,
             league,
             opponent,
+            prepared_opponent: None,
             max_turns,
         }
     }
     fn opponent_choice(&mut self) -> Choice {
+        if let Some(choice) = self.prepared_opponent.take() {
+            return choice;
+        }
         let side = 1 - self.side;
         let cs = choices(&self.battle, side);
         let index = sample(
@@ -339,6 +500,8 @@ impl<B: Backend> Env for BattleEnv<B> {
     type Observation = Vec<f32>;
     type Action = Vec<f32>;
     fn reset(&mut self) -> Vec<f32> {
+        self.prepared_opponent = None;
+        self.turn_rewards.lock().unwrap().reset_game();
         let a = self.rng.random_range(0..self.teams.len());
         let c = self.rng.random_range(0..self.teams.len());
         self.battle = Battle::from_teams(
@@ -354,7 +517,7 @@ impl<B: Backend> Env for BattleEnv<B> {
             Tracker::new(self.dex.clone(), 0),
             Tracker::new(self.dex.clone(), 1),
         ];
-        let bank = self.league.borrow();
+        let bank = self.league.lock().unwrap();
         self.opponent = bank[self.rng.random_range(0..bank.len())].clone();
         drop(bank);
         sync(&self.battle, &mut self.trackers, &mut self.cursor);
@@ -363,6 +526,22 @@ impl<B: Backend> Env for BattleEnv<B> {
     fn step(&mut self, action: Vec<f32>) -> Step<Vec<f32>> {
         let index = action[0] as usize;
         assert!(index < self.cs.len());
+        let mut diagnostic = if self.audit_every > 0
+            && self.audit.is_some()
+            && self.audit_rng.random_range(0..self.audit_every) == 0
+        {
+            let timer = Instant::now();
+            let sample = Sample::prepare(
+                &self.battle,
+                &self.trackers[self.side],
+                &self.cs[index],
+                &self.cs,
+            );
+            Some((sample, self.battle.log.len(), timer.elapsed().as_secs_f64()))
+        } else {
+            None
+        };
+        let previous_advantage = hp_advantage(&self.battle, self.side);
         // Select both sides from the same pre-action state. No opponent sees
         // the learner's submitted choice before selecting its own.
         let opp = if self.battle.side_needs_choice(1 - self.side) {
@@ -376,17 +555,32 @@ impl<B: Backend> Env for BattleEnv<B> {
         }
         sync(&self.battle, &mut self.trackers, &mut self.cursor);
         self.advance_to_learner();
+        if let Some((mut sample, from, prepare_seconds)) = diagnostic.take() {
+            let timer = Instant::now();
+            sample.finish(&self.battle, self.side, from);
+            let mut audit = self.audit.as_ref().unwrap().lock().unwrap();
+            audit.push(sample);
+            audit.seconds += prepare_seconds + timer.elapsed().as_secs_f64();
+        }
         self.steps += 1;
         // The configured finite-horizon game ends in a draw, not a time-limit
         // truncation requiring a bootstrap from a reset observation.
         let done = self.battle.ended || self.battle.turn >= self.max_turns || self.steps >= 512;
-        let reward = if self.battle.ended {
-            self.battle
-                .winner
-                .map_or(0., |s| if s == self.side { 1. } else { -1. })
-        } else {
-            0.
-        };
+        let reward = battle_reward(&self.battle, self.side, done, previous_advantage);
+        self.turn_rewards
+            .lock()
+            .unwrap()
+            .record(self.battle.turn, self.battle.ended, done, reward);
+        if done {
+            let outcome = if self.battle.ended {
+                self.battle
+                    .winner
+                    .map_or(2, |s| if s == self.side { 0 } else { 1 })
+            } else {
+                2
+            };
+            self.outcomes.lock().unwrap()[outcome] += 1;
+        }
         Step {
             observation: if done { vec![0.; OBS] } else { self.obs() },
             reward,
@@ -407,5 +601,46 @@ impl<B: Backend> Env for BattleEnv<B> {
     }
     fn action_space(&self) -> Space {
         Space::Discrete(ACTIONS)
+    }
+}
+
+#[cfg(test)]
+mod reconstruction_tests {
+    use super::*;
+    #[test]
+    fn locked_action_encodes_executed_move_and_target() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .map(|p| p.join("Model2/runs/opponent-suite-insample-heldout-20261104/dex.json"))
+            .find(|p| p.exists())
+            .expect("frozen regression dex required");
+        let dex = Arc::new(Dex::from_json(&std::fs::read_to_string(path).unwrap()).unwrap());
+        let mut t = Tracker::new(dex, 0);
+        for line in [
+            "|switch|p1a: Basculegion|Basculegion, L50|199/199",
+            "|switch|p2a: Pelipper|Pelipper, L50|100/100",
+            "|switch|p2b: Gengar|Gengar, L50|100/100",
+            "|turn|1",
+            "|move|p1a: Basculegion|Surf|p2a: Pelipper",
+            "|move|p1a: Basculegion|Solar Beam|p2b: Gengar|[still]",
+            "|-prepare|p1a: Basculegion|Solar Beam|p2b: Gengar",
+        ] {
+            t.feed(line);
+        }
+        let b = ninjask::world::World::from_view(&t, &Default::default()).unwrap();
+        let c = Choice::Turn(vec![SlotChoice::Move {
+            slot: 0,
+            target: 0,
+            mega: false,
+        }]);
+        let obs = observe_padded(&b, &t, &[c], 1);
+        let f = &obs[STATE..];
+        let mut expected = [0.; 8];
+        hash(&mut expected, "solarbeam");
+        assert_eq!(&f[..8], &expected);
+        assert_eq!(f[9], 1.);
+        assert_eq!(f[11], 120. / 250.);
+        assert_eq!(f[ACTION_TYPE_OFFSET + 9], 1.);
+        assert_eq!(f[ACTION_DESCRIPTOR + 2], active_reference(&t, 1, 1));
     }
 }

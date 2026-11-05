@@ -1,0 +1,17 @@
+2026-11-04: Conservative tracked-speed search
+
+Model2 now replaces sampled opposing base Speed with both tracked bounds (or the exact bound), enumerating combinations for all matched living foes, including reserves. Battle-engine modifiers still determine effective Speed and move priority. Each matrix cell averages chance samples within each speed scenario, then uses the minimum TOTAL return (immediate plus neural leaf). HP-only search applies the same conservative rule to its own HP objective. Simulation counts include all speed scenarios. No weights or encoding changed.
+
+Intent: prevent a single random catalog spread (e.g. Garchomp 149 vs Gengar 165 when actual Garchomp was 169) from deciding uncertain move order. Never use actual private opposing stats in decisions.
+
+Technical debt / limitations:
+- This is a pessimistic bound, not a posterior expected value. Independent per-cell worst scenarios may be mutually inconsistent across actions and can encourage overly defensive play.
+- Tracked bounds remain conservative; unknown abilities and broad speed-inference exclusions still discard useful public move-order evidence.
+- Only min/max endpoints are evaluated. Interior speed thresholds, ties, interactions between foes, speed-sensitive damage, and future speed changes can have different outcomes. Not a guarantee of the global worst case over all integer speeds.
+- Changing Speed alone while retaining the sampled nature/other stats can describe an inconsistent full spread. Replace with constrained coherent set sampling later.
+- Shortlists still come from one sampled world; this does not fix omitted threats such as Expanding Force. Unknown/unmatched opponents without available bounds retain sampled Speed.
+- Matching reconstruction to tracker uses stable Pokemon names, with one-to-one matching; duplicate nicknames/Illusion need stronger stable IDs.
+- Cost grows up to 2^n scenarios for n uncertain living opponents. Common chance seeds are reused across scenarios; tiny chance sample counts remain noisy.
+- Both sides use this change when both use matrix search, including HP-only. Replay comparisons are not isolated learner-only strength estimates.
+
+Validation: endpoint/order coverage and worst-total-return aggregation tests; replay the archived #124 paired setup with identical seed/weights/teams, preserve earlier executables and traces.

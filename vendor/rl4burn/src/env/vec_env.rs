@@ -11,15 +11,27 @@ use super::space::Space;
 /// Runs N copies of an environment, auto-resetting on done.
 /// Observations from all environments are returned as a Vec,
 /// suitable for batching into tensors.
-pub struct SyncVecEnv<E> {
+type StepExecutor<E> = fn(&mut [E], Vec<<E as Env>::Action>, usize) -> Vec<Step<<E as Env>::Observation>>;
+
+pub struct SyncVecEnv<E: Env> {
     envs: Vec<E>,
+    executor: Option<StepExecutor<E>>,
+    workers: usize,
 }
 
 impl<E: Env> SyncVecEnv<E> {
     /// Create a vectorized environment from a list of environment instances.
     pub fn new(envs: Vec<E>) -> Self {
         assert!(!envs.is_empty(), "need at least one environment");
-        Self { envs }
+        Self { envs, executor: None, workers: 1 }
+    }
+
+    /// Optional parallel CPU stepping. Results retain environment order and reset
+    /// semantics. Policy inference inside an environment may share one GPU.
+    pub fn new_parallel(envs: Vec<E>, workers: usize) -> Self
+    where E: Send, E::Action: Send, E::Observation: Send {
+        assert!(!envs.is_empty() && workers>0);
+        Self {envs,executor:Some(parallel_step::<E>),workers}
     }
 
     /// Number of parallel environments.
@@ -43,6 +55,9 @@ impl<E: Env> SyncVecEnv<E> {
             self.envs.len(),
             "must provide one action per environment"
         );
+        if let Some(executor)=self.executor {
+            return executor(&mut self.envs,actions,self.workers);
+        }
         actions
             .into_iter()
             .zip(self.envs.iter_mut())
@@ -92,6 +107,23 @@ impl<E: Env> SyncVecEnv<E> {
                 .collect(),
         )
     }
+}
+
+fn parallel_step<E:Env+Send>(envs:&mut [E], actions:Vec<E::Action>, workers:usize)->Vec<Step<E::Observation>>
+where E::Action:Send,E::Observation:Send {
+    let chunk=envs.len().div_ceil(workers.min(envs.len()));
+    std::thread::scope(|scope| {
+        let mut jobs=Vec::new();
+        for (group, actions) in envs.chunks_mut(chunk).zip(actions.chunks(chunk)) {
+            let owned=actions.to_vec();
+            jobs.push(scope.spawn(move || group.iter_mut().zip(owned).map(|(env,action)| {
+                let mut step=env.step(action);
+                if step.done() {step.observation=env.reset();}
+                step
+            }).collect::<Vec<_>>()));
+        }
+        jobs.into_iter().flat_map(|job|job.join().expect("environment worker panicked")).collect()
+    })
 }
 
 #[cfg(test)]
@@ -178,5 +210,19 @@ mod tests {
     fn num_envs() {
         let venv = SyncVecEnv::new(vec![CountEnv::new(1), CountEnv::new(1), CountEnv::new(1)]);
         assert_eq!(venv.num_envs(), 3);
+    }
+
+    #[test]
+    fn parallel_steps_match_serial_order_rewards_and_auto_resets() {
+        let make=|| vec![CountEnv::new(2),CountEnv::new(3),CountEnv::new(4)];
+        let mut serial=SyncVecEnv::new(make());
+        let mut parallel=SyncVecEnv::new_parallel(make(),2);
+        assert_eq!(serial.reset(),parallel.reset());
+        for _ in 0..12 {
+            for (a,b) in serial.step(vec![0;3]).into_iter().zip(parallel.step(vec![0;3])) {
+                assert_eq!(a.observation,b.observation);assert_eq!(a.reward,b.reward);
+                assert_eq!(a.terminated,b.terminated);assert_eq!(a.truncated,b.truncated);
+            }
+        }
     }
 }

@@ -11,6 +11,23 @@ use crate::dex::types::*;
 use crate::state::*;
 
 impl Battle {
+    /// Resolve a request move slot to the move the engine will execute.
+    /// Locked requests contain one entry at slot 0, regardless of moveset order.
+    pub fn choice_move_id(&self, r: MonRef, slot: usize) -> Option<MoveId> {
+        match self.locked_move(r) {
+            Some(crate::moves::LockedMove::Move(id)) => Some(id),
+            Some(crate::moves::LockedMove::Recharge) => None,
+            None if slot == STRUGGLE => self.dex.move_id("struggle"),
+            None => self.mon(r).moves.get(slot).map(|m| m.id),
+        }
+    }
+
+    /// The target committed by a locked action, or the newly selected target.
+    pub fn choice_target_loc(&self, r: MonRef, requested: i8) -> i8 {
+        self.locked_move(r)
+            .map_or(requested, |lock| self.locked_action(r, lock).1)
+    }
+
     /// Submit a choice for a side, in Showdown's syntax. When both sides
     /// have chosen, the turn (or preview, or switch phase) runs.
     pub fn choose(&mut self, s: usize, input: &str) -> Result<(), String> {
@@ -612,6 +629,9 @@ impl Battle {
                     "condition": secret_health(m.hp, m.maxhp, m.status.id()),
                     "active": m.is_active,
                     "stats": stats,
+                    "nature": m.nature_name,
+                    "statPoints": m.points,
+                    "chargingTarget": m.vol.charging.map(|_| m.vol.charging_target_loc),
                     "moves": m.moves.iter().map(|ms| self.dex.mv(ms.id).id.clone()).collect::<Vec<_>>(),
                     "baseAbility": self.dex.ability(m.base_ability).id,
                     "item": m.item.map(|it| self.dex.item(it).id.clone()).unwrap_or_default(),
